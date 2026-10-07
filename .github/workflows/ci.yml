@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push: { branches: [main] }
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: surfer
+          POSTGRES_PASSWORD: surfer
+          POSTGRES_DB: surfer
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U surfer"
+          --health-interval 5s --health-timeout 5s --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - name: Validate Prisma schema & apply migrations
+        run: |
+          npx prisma migrate deploy || npx prisma db push
+          npx prisma generate
+        env:
+          DATABASE_URL: postgresql://surfer:surfer@localhost:5432/surfer
+      - name: Run unit + integration tests
+        run: npm test
+        env:
+          DATABASE_URL: postgresql://surfer:surfer@localhost:5432/surfer
+          RAZORPAY_WEBHOOK_SECRET: ci-secret
+          AUTH_SECRET: ci-secret-ci-secret-ci-secret-ci
+      - name: Build
+        run: npm run build
+        env:
+          DATABASE_URL: postgresql://surfer:surfer@localhost:5432/surfer
+          AUTH_SECRET: ci-secret-ci-secret-ci-secret-ci
+          NEXT_PUBLIC_APP_URL: http://localhost:3000

@@ -1,0 +1,518 @@
+// prisma/schema.prisma — Surfer Test MVP
+// Conventions: cuid ids, createdAt/updatedAt everywhere, soft delete via deletedAt
+// on user-facing entities, @@index on all foreign keys used in lookups.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- ENUMS ----------
+
+enum Role {
+  TOURIST
+  GUIDE
+  ADMIN
+}
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  PREFER_NOT_TO_SAY
+}
+
+enum GuideStatus {
+  PENDING_VERIFICATION
+  KYC_UNDER_REVIEW
+  APPROVED
+  REJECTED
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum KycStatus {
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+  RE_VERIFICATION_REQUIRED
+}
+
+enum BookingStatus {
+  REQUESTED
+  PENDING_PAYMENT
+  CONFIRMED
+  GUIDE_ACCEPTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  DISPUTED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+enum PayoutStatus {
+  PENDING
+  PROCESSED
+  FAILED
+}
+enum ReportStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  DISMISSED
+}
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+}
+enum AgreementType {
+  TERMS
+  GUIDE_CODE_OF_CONDUCT
+  SAFETY_POLICY
+  CANCELLATION
+  COMMISSION
+  NDA
+}
+
+// ---------- AUTH / USERS ----------
+
+model User {
+  id            String    @id @default(cuid())
+  email         String?   @unique
+  phone         String?   @unique
+  passwordHash  String? // null for OAuth-only accounts
+  name          String
+  image         String? // avatar URL (public bucket)
+  role          Role      @default(TOURIST)
+  isSuspended   Boolean   @default(false)
+  emailVerified DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deletedAt     DateTime?
+
+  touristProfile TouristProfile?
+  guideProfile   GuideProfile?
+  accounts       Account[]
+  sessions       Session[]
+  reportsFiled   Report[]        @relation("ReportsFiled")
+  reportsReceived Report[]       @relation("ReportsReceived")
+  messagesSent   Message[]
+  notifications  Notification[]
+
+  @@index([role])
+}
+
+// Auth.js adapter models (email/oauth sessions)
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+  @@unique([identifier, token])
+}
+
+model TouristProfile {
+  id            String  @id @default(cuid())
+  userId        String  @unique
+  user          User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  homeCountry   String?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  bookings      Booking[]
+  reviews       Review[]
+}
+
+// ---------- LOCATION GRAPH ----------
+
+model State {
+  id        String       @id @default(cuid())
+  name      String       @unique
+  cities    City[]
+  destinations Destination[]
+}
+
+model City {
+  id        String   @id @default(cuid())
+  name      String
+  stateId   String
+  state     State    @relation(fields: [stateId], references: [id])
+  destinations Destination[]
+  attractions  Attraction[]
+  guideProfiles GuideProfile[]
+  @@unique([name, stateId])
+}
+
+model Destination { // e.g. "Jaipur", "Goa", "Manali" — searchable unit
+  id          String  @id @default(cuid())
+  name        String
+  slug        String  @unique
+  cityId      String?
+  city        City?   @relation(fields: [cityId], references: [id])
+  stateId     String?
+  state       State?  @relation(fields: [stateId], references: [id])
+  description String? @db.Text
+  imageUrl    String?
+  isPopular   Boolean @default(false)
+  attractions Attraction[]
+  guideLocations GuideLocation[]
+  bookings     Booking[]
+}
+
+model Attraction { // e.g. "Hawa Mahal" — maps to a destination's guides
+  id            String      @id @default(cuid())
+  name          String
+  destinationId String
+  destination   Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade)
+  cityId        String?
+  city          City?       @relation(fields: [cityId], references: [id])
+  @@index([destinationId])
+}
+
+// ---------- GUIDES ----------
+
+model GuideProfile {
+  id             String      @id @default(cuid())
+  userId         String      @unique
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status         GuideStatus @default(PENDING_VERIFICATION)
+  rejectionReason String?    @db.Text
+
+  // identity & background
+  dob            DateTime?
+  gender         Gender?
+  bio            String?    @db.Text
+  photoUrl       String?    // public bucket
+  currentCityId  String?
+  currentCity    City?      @relation(fields: [currentCityId], references: [id])
+  permanentAddress String?  @db.Text // minimize; store only what KYC needs
+  college        String?
+  studentId      String?    // reference number only, NOT a stored document
+  isStudentVerified Boolean @default(false)
+  experienceYears Int       @default(0)
+
+  // money & contact (payout destination — sensitive)
+  payoutUpiId    String?
+  payoutAccountName String?
+  payoutAccountNumber String? // encrypt at app layer (KMS/field encryption) before MVP scale
+  payoutIfsc     String?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+
+  basePrice      Int         // INR, e.g. per 2-hour slot
+  priceUnit      String      @default("PER_2_HOURS")
+  maxBookingsPerDay Int      @default(2)
+  averageRating  Float       @default(0)
+  reviewCount    Int         @default(0)
+
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  deletedAt      DateTime?
+
+  languages      GuideLanguage[]
+  locations      GuideLocation[]
+  tourTypes      GuideTourType[]
+  availability   GuideAvailability[]
+  blockedDates   GuideBlockedDate[]
+  bookings       Booking[]
+  payouts        GuidePayout[]
+  reviews        Review[]
+  kyc            KycVerification[]
+  agreements     Agreement[]
+}
+
+model GuideLanguage {
+  id      String @id @default(cuid())
+  guideId String
+  guide   GuideProfile @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  language String // ISO 639 code or name
+  @@unique([guideId, language])
+}
+
+model GuideLocation { // coverage: destination-level + optional attraction-level
+  id            String       @id @default(cuid())
+  guideId       String
+  guide         GuideProfile @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  destinationId String
+  destination   Destination  @relation(fields: [destinationId], references: [id], onDelete: Cascade)
+  attractionId  String?
+  @@unique([guideId, destinationId, attractionId])
+  @@index([destinationId]) // core discovery index
+}
+
+model TourType {
+  id      String @id @default(cuid())
+  name    String @unique // HERITAGE, STREET_FOOD, PHOTOGRAPHY, NATURE, ADVENTURE, SPIRITUAL, NIGHTLIFE
+  guides  GuideTourType[]
+}
+
+model GuideTourType {
+  guideId   String
+  tourTypeId String
+  guide     GuideProfile @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  tourType  TourType     @relation(fields: [tourTypeId], references: [id], onDelete: Cascade)
+  @@id([guideId, tourTypeId])
+}
+
+model GuideAvailability {
+  id         String  @id @default(cuid())
+  guideId    String
+  guide      GuideProfile @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  dayOfWeek  Int     // 0–6
+  startTime  String  // "09:00"
+  endTime    String  // "18:00"
+  @@index([guideId, dayOfWeek])
+}
+
+model GuideBlockedDate {
+  id      String @id @default(cuid())
+  guideId String
+  guide   GuideProfile @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  date    DateTime @db.Date
+  reason  String?
+  @@unique([guideId, date])
+}
+
+model KycVerification {
+  id          String    @id @default(cuid())
+  guideId     String
+  guide       GuideProfile @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  status      KycStatus @default(PENDING)
+  idType      String?   // "AADHAAR" | "PAN" | "PASSPORT" | "STUDENT_ID"
+  idLastFour  String?   // never store full ID numbers
+  documentUrls Json?    // private R2 object keys only; fetch via signed URL
+  submittedAt DateTime  @default(now())
+  reviewedAt  DateTime?
+  reviewerId  String?
+  reviewNotes String?   @db.Text
+  @@index([status]) // admin review queue
+}
+
+model Agreement {
+  id        String        @id @default(cuid())
+  guideId   String
+  guide     GuideProfile  @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  type      AgreementType
+  version   String
+  acceptedAt DateTime     @default(now())
+  @@unique([guideId, type, version])
+}
+
+// ---------- BOOKINGS & PAYMENTS ----------
+
+model Booking {
+  id             String        @id @default(cuid())
+  bookingRef     String        @unique // human-friendly, e.g. ST-2026-XXXX
+  touristId      String
+  tourist        TouristProfile @relation(fields: [touristId], references: [id])
+  guideId        String
+  guide          GuideProfile  @relation(fields: [guideId], references: [id])
+  destinationId  String
+  destination    Destination? @relation(fields: [destinationId], references: [id])
+  attractionId   String?
+  tourTypeId     String?
+  status         BookingStatus @default(REQUESTED)
+  date           DateTime      @db.Date
+  startTime      String        // "10:00"
+  durationHours  Int
+  partySize      Int           @default(1)
+  meetingLocation String
+  notes          String?       @db.Text
+  totalAmount    Int           // INR
+  currency       String        @default("INR")
+  commissionAmount Int         // snapshot at booking time
+  guideEarnings  Int           // totalAmount - commissionAmount
+  cancelledBy    Role?
+  cancelReason   String?       @db.Text
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  payments   Payment[]
+  review     Review?
+  dispute    Dispute?
+  conversation Conversation?
+
+  @@index([guideId, date, startTime]) // double-booking guard index
+  @@index([touristId])
+  @@index([status])
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  bookingId         String
+  booking           Booking       @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  provider          String        @default("razorpay")
+  providerOrderId   String?       @unique
+  providerPaymentId String?
+  signature         String?
+  amount            Int
+  commissionAmount  Int
+  guideEarnings     Int
+  status            PaymentStatus @default(CREATED)
+  rawWebhook        Json?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  refunds           Refund[]
+}
+
+model Refund {
+  id                 String   @id @default(cuid())
+  paymentId          String
+  payment            Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  amount             Int
+  reason             String?
+  providerRefundId   String?
+  processedById      String? // admin
+  createdAt          DateTime @default(now())
+}
+
+model GuidePayout { // admin-processed (manual bank/UPI transfer, then marked PROCESSED)
+  id          String      @id @default(cuid())
+  guideId     String
+  guide       GuideProfile @relation(fields: [guideId], references: [id])
+  bookingId   String?     // null for batch payouts
+  amount      Int
+  status      PayoutStatus @default(PENDING)
+  method      String?     // UPI / NEFT
+  reference   String?     // bank/UPI txn ref
+  processedById String?
+  processedAt DateTime?
+  createdAt   DateTime    @default(now())
+  @@index([guideId, status])
+}
+
+// ---------- REVIEWS & CONVERSATIONS ----------
+
+model Review {
+  id        String   @id @default(cuid())
+  bookingId String   @unique // one review per booking — enforces "only completed bookings"
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  guideId   String
+  guide     GuideProfile @relation(fields: [guideId], references: [id], onDelete: Cascade)
+  touristId String
+  tourist   TouristProfile @relation(fields: [touristId], references: [id], onDelete: Cascade)
+  rating    Int      // 1–5, enforced in service layer + CHECK via app validation
+  comment   String?  @db.Text
+  response  String?  @db.Text // guide's public reply
+  isFlagged Boolean  @default(false)
+  isRemoved Boolean  @default(false)
+  createdAt DateTime @default(now())
+  @@index([guideId, isRemoved])
+}
+
+model Conversation {
+  id        String   @id @default(cuid())
+  bookingId String   @unique
+  booking   Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  messages  Message[]
+  createdAt DateTime @default(now())
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User         @relation(fields: [senderId], references: [id])
+  body           String       @db.Text
+  isRead         Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+  @@index([conversationId, createdAt])
+}
+
+// ---------- TRUST & SAFETY / OPS ----------
+
+model Report {
+  id          String       @id @default(cuid())
+  reporterId  String
+  reporter    User         @relation("ReportsFiled", fields: [reporterId], references: [id])
+  targetUserId String
+  targetUser  User         @relation("ReportsReceived", fields: [targetUserId], references: [id])
+  bookingId   String?
+  reason      String       @db.Text
+  status      ReportStatus @default(OPEN)
+  resolution  String?      @db.Text
+  createdAt   DateTime     @default(now())
+  resolvedAt  DateTime?
+  @@index([status])
+}
+
+model Dispute {
+  id          String       @id @default(cuid())
+  bookingId   String       @unique
+  booking     Booking      @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  openedById  String
+  reason      String       @db.Text
+  status      DisputeStatus @default(OPEN)
+  resolution  String?      @db.Text
+  resolvedById String?
+  createdAt   DateTime     @default(now())
+  resolvedAt  DateTime?
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String   // BOOKING_REQUEST, PAYMENT_CONFIRMED, KYC_APPROVED, ...
+  payload   Json?
+  emailSent Boolean  @default(false)
+  readAt    DateTime?
+  createdAt DateTime @default(now())
+  @@index([userId, readAt])
+}
+
+model AdminAction { // audit log — append-only
+  id         String   @id @default(cuid())
+  adminId    String
+  action     String   // REVIEW_KYC, SUSPEND_USER, PROCESS_REFUND, ...
+  entityType String
+  entityId   String
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+  @@index([entityType, entityId])
+}
+
+model PlatformSettings {
+  id               String  @id @default("singleton")
+  commissionPercent Float  @default(15)
+  cancellationPolicy Json? // hours-before thresholds & refund %
+  updatedAt        DateTime @updatedAt
+}
